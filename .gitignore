@@ -1,0 +1,8 @@
+/_gsdata_/
+/data/
+/test**
+*.pyc
+web_radio.py
+atest*
+form.py
+/old/
