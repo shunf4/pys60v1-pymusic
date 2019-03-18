@@ -8,9 +8,26 @@ import sys
 import re
 import traceback
 
+try:
+    import urlaudiostream_pymusic as urlaudiostream
+except:
+    pass
+
 ORDER_LISTCYCLE = 0
 ORDER_SINGLECYCLE = 1
 ORDER_SHUFFLE = 2
+
+QUALITIES_HIGHTOLOW = [3, 2, 1]
+
+STATE_MASK = 3
+STATE_NOT_LOADED = 0
+STATE_NOT_PLAYING = 1
+STATE_PLAYING = 2
+STATE_PAUSING = 3
+
+USING_MASK = 1 << 2
+USING_AUDIOPLAYER = 0 << 2
+USING_URLSTREAMPLAYER = 1 << 2
 
 RE_LRC_USEFUL = re.compile(r'\[\D[^\]]*\][\n]*(\[\d.*)',re.DOTALL)
 RE_LRC_LRCLINE_ALLTIMES = re.compile(r"\[(\d+:\d+(?:\.\d+)?)\]")
@@ -113,7 +130,7 @@ class PlayerManager(object):
 
             },
             "monitor": None,
-            "useOnlinePlayer": True,
+            "useUrlStreamPlayer": True,
         }
         '''
         "apis": {
@@ -137,6 +154,11 @@ class PlayerManager(object):
         self.orderList = []
         
         self.prevLyricsI = 0
+
+        self.latestPlayAfterDownload = None
+
+        self.audioPlayer = None
+        self.uasPlayer = None
 
     def _updateConfig(self, config):
         self.config.update(config)
@@ -244,7 +266,7 @@ class PlayerManager(object):
                 kwargs['progressCallback'] = updateProgress
                 return util.rawHTTP(host, url, https, method, params, query, header, logger, writeIO, **kwargs)
 
-            # Before the two functions: i = 0
+            # i = 0
             for song in self.songList:
                 if self.lyricsList[i]:
                     continue
@@ -363,3 +385,85 @@ class PlayerManager(object):
         self.prevLyricsI = currentI
 
         return currentLyrics, currentI
+
+    def isPlayAfterDownloadCancelled(self, func):
+        return self.latestPlayAfterDownload is not func
+
+    def _play(self):
+        # 播放当前应该播放的歌曲
+
+        currentState = self.state() & STATE_MASK
+
+        if currentState == STATE_NOT_LOADED:
+            return 
+        elif currentState == STATE_NOT_PLAYING:
+            pass
+        elif currentState == STATE_PLAYING:
+            self._stop()
+        elif currentState == STATE_PAUSING:
+            self._stop()
+        else:
+            raise ValueError
+
+        song = self.songList[self.orderList[self.seq]]
+        api = self.config['apis'][song.apiClassString]
+        songPathFormat = a.paths['songPathById']
+        songPathFormat_link = a.paths['songPathById_link']
+
+        songPath = None
+
+        for quality in QUALITIES_HIGHTOLOW:
+            songPath = songPathFormat % (song.id(), quality)
+            songPath_link = songPathFormat_link % (song.id(), quality)
+            
+            if os.path.exists(songPath):
+                if os.path.isfile(songPath):
+                    break
+                os.rmdir(songPath)
+                songPath = None
+
+            if os.path.exists(songPath_link):
+                if os.path.isfile(songPath_link):
+                    try:
+                        f = open(songPath_link, "rb")
+                        songPath = f.read()
+                        if os.path.isfile(songPath):
+                            break
+                    except:
+                        pass
+                    os.remove(songPath_link)
+                    songPath = None
+                else:
+                    os.rmdir(songPath_link)
+                    songPath = None
+
+        def playAudioWrapped():
+            if self.isPlayAfterDownloadCancelled(playAudioWrapped):
+                return
+            self._play_audio(songPath)
+
+        if songPath == None:
+            if self.config['useUrlStreamPlayer']:
+                self._play_urlstream()
+            else:
+                songPath = songPathFormat % (song.id(), self.config['defaultDownloadQuality'])
+                monitor = self.config.get("monitor")
+                if monitor:
+                    import taskQueue
+                    self.latestPlayAfterDownload = playAudioWrapped
+                    downloadTask = taskQueue.Task(
+                        unicode("下载 %s") % song.name(),
+                        util.rawHTTP_thread,
+                        ("", self.urlList[self.orderList[self.seq]].replace("https://", "http://"), False, 'GET', {}, "", {}, self.config["logger"], songPath),
+                        {},
+                        None,
+                        None,
+                        playAudioWrapped
+                    )
+                    monitor.newTask(downloadTask)
+        else:
+            playAudioWrapped()
+
+    def _play_urlstream(self):
+        if self.uasPlayer is None:
+            self.uasPlayer = urlaudiostream.New()

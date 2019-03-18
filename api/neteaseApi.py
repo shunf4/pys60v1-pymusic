@@ -285,11 +285,12 @@ class NEApiUser(api.ApiUser):
 
 class NEApi(api.Api):
     def __init__(self, initConfig = {}):
+        # 关于音质：1 - l, 2 - m, 3 - h
         super(NEApi, self).__init__(initConfig)
         self.paths = {
             "directoryPath": [util.getPath("NEApi"), util.getPath("NEApi/pic"), util.getPath("NEApi/lyrics")],
             "songPathById": util.getPath("NEApi/%s_%d.mp3"),
-            "songPathById_link": util.getPath("NEApi/%s_%s.txt"),
+            "songPathById_link": util.getPath("NEApi/%s_%d.txt"),
             "albumCoverById": util.getPath("NEApi/pic/%s.png"),
             "lyricsById": util.getPath("NEApi/lyrics/%s.lrc.json"),
         }
