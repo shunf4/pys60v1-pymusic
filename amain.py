@@ -385,8 +385,18 @@ def main():
     routineMan.run()
     appuifw2.app.set_exit()
 
-def tryWrapper(func, args = (), kwargs = {}):
-    def wrapped():
+def tryWrapper(func, specifiedArgs = None, specifiedKwargs = {}):
+    def wrapped_specified():
+        f = func
+        try:
+            if type(f) is types.UnboundMethodType:
+                f = f.im_func
+
+            f(*specifiedArgs, **specifiedKwargs)
+        except Exception, e:
+            exceptionHandler(e)
+
+    def wrapped(*args, **kwargs):
         f = func
         try:
             if type(f) is types.UnboundMethodType:
@@ -395,7 +405,11 @@ def tryWrapper(func, args = (), kwargs = {}):
             f(*args, **kwargs)
         except Exception, e:
             exceptionHandler(e)
-    return wrapped
+
+    if specifiedArgs is None:
+        return wrapped
+    else:
+        return wrapped_specified
 
 def progressNoteWrapper(func):
     def wrapped(*args, **kwargs):

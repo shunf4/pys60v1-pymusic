@@ -7,6 +7,7 @@ import os
 import sys
 import re
 import traceback
+import audio
 
 try:
     import urlaudiostream_pymusic as urlaudiostream
@@ -19,21 +20,35 @@ ORDER_SHUFFLE = 2
 
 QUALITIES_HIGHTOLOW = [3, 2, 1]
 
-STATE_MASK = 3
-STATE_NOT_LOADED = 0
-STATE_NOT_PLAYING = 1
+STATE_NOTLOADED = 0
+STATE_NOTPLAYING = 1
+STATE_BUFFERING = 4         # 下载中/缓冲中
 STATE_PLAYING = 2
 STATE_PAUSING = 3
 
-USING_MASK = 1 << 2
-USING_AUDIOPLAYER = 0 << 2
-USING_URLSTREAMPLAYER = 1 << 2
+USING_AUDIOPLAYER = 0
+USING_URLAUDIOSTREAMPLAYER = 1
 
 RE_LRC_USEFUL = re.compile(r'\[\D[^\]]*\][\n]*(\[\d.*)',re.DOTALL)
 RE_LRC_LRCLINE_ALLTIMES = re.compile(r"\[(\d+:\d+(?:\.\d+)?)\]")
 RE_LRC_LRCLINE_CONTENT = re.compile(r"\[\d+:\d+(?:\.\d+)?\](?!\[\d+:\d+(?:\.\d+)?\])(.*)")
 
 STR_UTF8_BOM = "\xEF\xBB\xBF"
+
+UASSTATE_STOP = 0
+UASSTATE_CONNECTING = 1
+UASSTATE_CONNECTED = 2
+UASSTATE_READINGINFO = 3
+UASSTATE_PLAYING = 4
+
+UASERROR_NOERROR = 0
+UASERROR_UNSUPPORTED = 1
+UASERROR_READERROR = 2
+UASERROR_END = 3
+
+DEVICE_MAX_VOLUME = 100
+
+tryWrapper = lambda x:lambda :None
 
 def formatLyrics(lyrics):
     if lyrics.noLyrics():
@@ -130,7 +145,7 @@ class PlayerManager(object):
 
             },
             "monitor": None,
-            "useUrlStreamPlayer": True,
+            "useUrlAudioStreamPlayer": True,
         }
         '''
         "apis": {
@@ -160,6 +175,18 @@ class PlayerManager(object):
         self.audioPlayer = None
         self.uasPlayer = None
 
+        self.state = STATE_NOTPLAYING
+        self.using = USING_AUDIOPLAYER
+
+        self.changed = []
+
+    def addSubscriber(self, func):
+        self.changed.append(func)
+
+    def update(self):
+        for func in self.changed:
+            func()
+
     def _updateConfig(self, config):
         self.config.update(config)
         self.logger = self.config['logger']
@@ -171,6 +198,9 @@ class PlayerManager(object):
 
         获取 URL 后 URL 仍为 None 的歌曲, 会从播放列表中删除(版权曲)
         '''
+
+        # TODO: 获取到待播放歌曲后立即获取 url 的做法容易导致播放到后面的歌曲时 url 失效，需要引入 url 定期刷新机制或改成每次播放前获取 url 来解决这个问题
+
         if urlList:
             assert(len(songList) == len(urlList))
 
@@ -392,23 +422,24 @@ class PlayerManager(object):
     def _play(self):
         # 播放当前应该播放的歌曲
 
-        currentState = self.state() & STATE_MASK
+        currentState = self.state
 
-        if currentState == STATE_NOT_LOADED:
+        if currentState == STATE_NOTLOADED:
             return 
-        elif currentState == STATE_NOT_PLAYING:
+        elif currentState == STATE_NOTPLAYING:
             pass
         elif currentState == STATE_PLAYING:
             self._stop()
         elif currentState == STATE_PAUSING:
             self._stop()
         else:
-            raise ValueError
+            self.state = STATE_NOTPLAYING
+            raise ValueError, unicode("PlayerManager state not good")
 
         song = self.songList[self.orderList[self.seq]]
         api = self.config['apis'][song.apiClassString]
-        songPathFormat = a.paths['songPathById']
-        songPathFormat_link = a.paths['songPathById_link']
+        songPathFormat = api.paths['songPathById']
+        songPathFormat_link = api.paths['songPathById_link']
 
         songPath = None
 
@@ -437,33 +468,250 @@ class PlayerManager(object):
                     os.rmdir(songPath_link)
                     songPath = None
 
-        def playAudioWrapped():
-            if self.isPlayAfterDownloadCancelled(playAudioWrapped):
+        def playAudioAfterDownloadWrapped():
+            if self.isPlayAfterDownloadCancelled(playAudioAfterDownloadWrapped):
                 return
+            os.rename(songPath + ".download", songPath)
             self._play_audio(songPath)
 
         if songPath == None:
-            if self.config['useUrlStreamPlayer']:
-                self._play_urlstream()
+            if self.config['useUrlAudioStreamPlayer']:
+                self._play_urlAudioStream()
             else:
                 songPath = songPathFormat % (song.id(), self.config['defaultDownloadQuality'])
                 monitor = self.config.get("monitor")
                 if monitor:
                     import taskQueue
-                    self.latestPlayAfterDownload = playAudioWrapped
+                    self.latestPlayAfterDownload = playAudioAfterDownloadWrapped
                     downloadTask = taskQueue.Task(
                         unicode("下载 %s") % song.name(),
                         util.rawHTTP_thread,
-                        ("", self.urlList[self.orderList[self.seq]].replace("https://", "http://"), False, 'GET', {}, "", {}, self.config["logger"], songPath),
+                        ("", self.urlList[self.orderList[self.seq]].replace("https://", "http://"), False, 'GET', {}, "", {}, self.config["logger"], songPath + ".download"),
                         {},
                         None,
                         None,
-                        playAudioWrapped
+                        tryWrapper(playAudioAfterDownloadWrapped)
                     )
                     monitor.newTask(downloadTask)
-        else:
-            playAudioWrapped()
 
-    def _play_urlstream(self):
+                self.state = STATE_BUFFERING
+                self.update()
+        else:
+            self._play_audio(songPath)
+
+    def _urlAudioStream_callback(self, uasState, uasError, uasInfo):
+        currentState = self.state
+        currentUsing = self.using
+        if currentUsing == USING_AUDIOPLAYER:
+            # 这种情况一般都是 urlaudiostream 模块延迟反应，实际程序已经在使用 audio 播放歌曲了
+            self.logger.warning(u"Not using urlaudiostream, received callback %s %s %s" % (uasState, uasError, uasInfo))
+        elif currentUsing == USING_URLAUDIOSTREAMPLAYER:
+            pass
+        else:
+            self.state = USING_URLAUDIOSTREAMPLAYER
+            raise ValueError, unicode("PlayerManager using not good")
+
+        if currentState == STATE_NOTLOADED:
+            self.state = STATE_NOTPLAYING
+            raise ValueError, unicode("PlayerManager state inappropriate (NOT_LOADED)")
+        elif currentState == STATE_NOTPLAYING:
+            if uasState == UASSTATE_STOP:
+                self._urlAudioStream_stopTiming()
+                pass
+            elif uasState == UASSTATE_CONNECTING:
+                self.using = USING_URLAUDIOSTREAMPLAYER
+                self.state = STATE_BUFFERING
+                pass
+            elif uasState == UASSTATE_CONNECTED:
+                self.using = USING_URLAUDIOSTREAMPLAYER
+                self.state = STATE_BUFFERING
+                pass
+            elif uasState == UASSTATE_READINGINFO:
+                self.using = USING_URLAUDIOSTREAMPLAYER
+                self.state = STATE_BUFFERING
+                pass
+            elif uasState == UASSTATE_PLAYING:
+                self.using = USING_URLAUDIOSTREAMPLAYER
+                self.state = STATE_PLAYING
+                self._urlAudioStream_playTiming()
+            else:
+                # Incorrect value
+                pass
+        elif currentState == STATE_PAUSING:
+            self.logger.warning(u"PlayerManager state inappropriate (STATE_PAUSING when USING_UAS)")
+            if uasState == UASSTATE_STOP:
+                self._urlAudioStream_stopTiming()
+                pass
+            elif uasState == UASSTATE_CONNECTING:
+                self.using = USING_URLAUDIOSTREAMPLAYER
+                self.state = STATE_BUFFERING
+                pass
+            elif uasState == UASSTATE_CONNECTED:
+                self.using = USING_URLAUDIOSTREAMPLAYER
+                self.state = STATE_BUFFERING
+                pass
+            elif uasState == UASSTATE_READINGINFO:
+                self.using = USING_URLAUDIOSTREAMPLAYER
+                self.state = STATE_BUFFERING
+                pass
+            elif uasState == UASSTATE_PLAYING:
+                self.using = USING_URLAUDIOSTREAMPLAYER
+                self.state = STATE_PLAYING
+                self._urlAudioStream_playTiming()
+            else:
+                # Incorrect value
+                pass
+        elif currentState == STATE_BUFFERING:
+            if uasState == UASSTATE_STOP:
+                self._urlAudioStream_stopTiming()
+                self.state = STATE_NOTPLAYING
+                pass
+            elif uasState == UASSTATE_CONNECTING:
+                self.using = USING_URLAUDIOSTREAMPLAYER
+                pass
+            elif uasState == UASSTATE_CONNECTED:
+                self.using = USING_URLAUDIOSTREAMPLAYER
+                pass
+            elif uasState == UASSTATE_READINGINFO:
+                self.using = USING_URLAUDIOSTREAMPLAYER
+                pass
+            elif uasState == UASSTATE_PLAYING:
+                self.using = USING_URLAUDIOSTREAMPLAYER
+                self.state = STATE_PLAYING
+                self._urlAudioStream_playTiming()
+            else:
+                # Incorrect value
+                pass
+        elif currentState == STATE_PLAYING:
+            if uasState == UASSTATE_STOP:
+                self._urlAudioStream_stopTiming()
+                self.state = STATE_NOTPLAYING
+                if uasError == UASERROR_END:
+                    self._next()
+                pass
+            elif uasState == UASSTATE_CONNECTING:
+                self.logger.warning(u"PlayerManager state inappropriate (CONNECTING when PLAYING)")
+                self.using = USING_URLAUDIOSTREAMPLAYER
+                self.state = STATE_BUFFERING
+                self._urlAudioStream_stopTiming()
+                pass
+            elif uasState == UASSTATE_CONNECTED:
+                self.logger.warning(u"PlayerManager state inappropriate (CONNECTED when PLAYING)")
+                self.using = USING_URLAUDIOSTREAMPLAYER
+                self.state = STATE_BUFFERING
+                self._urlAudioStream_stopTiming()
+                pass
+            elif uasState == UASSTATE_READINGINFO:
+                self.logger.warning(u"PlayerManager state inappropriate (READINGINFO when PLAYING)")
+                self.using = USING_URLAUDIOSTREAMPLAYER
+                self.state = STATE_BUFFERING
+                self._urlAudioStream_stopTiming()
+                pass
+            elif uasState == UASSTATE_PLAYING:
+                self.logger.warning(u"PlayerManager state inappropriate (PLAYING when PLAYING)")
+                self.using = USING_URLAUDIOSTREAMPLAYER
+                self.state = STATE_PLAYING
+                self._urlAudioStream_playTiming()
+            else:
+                # Incorrect value
+                pass
+        self.update()
+
+        if uasError != UASERROR_NOERROR and uasError != UASERROR_END:
+            raise Exception, u"UrlAudioStream Error: %s" % [u"", u"Unsupported format", u"Read error", u""][uasError]
+
+    def _audio_callback(self, aPrevState, aCurrState, aErrCode):
+        currentState = self.state
+        currentUsing = self.using
+        if currentUsing == USING_URLAUDIOSTREAMPLAYER:
+            self.state = USING_AUDIOPLAYER
+            self.logger.warning(u"Not using audio, received callback %s %s %s" % (aPrevState, aCurrState, aErrCode))
+        elif currentUsing == USING_AUDIOPLAYER:
+            pass
+        elif currentUsing == USING_AUDIOPLAYER:
+            self.state = USING_URLAUDIOSTREAMPLAYER
+            raise ValueError, unicode("PlayerManager using not good")
+
+        if currentState == STATE_NOTLOADED:
+            self.state = STATE_NOTPLAYING
+            raise ValueError, unicode("PlayerManager state inappropriate (NOT_LOADED)")
+        elif currentState == STATE_NOTPLAYING:
+            if aCurrState == audio.ENotReady or aCurrState == audio.EOpen:
+                # Strange
+                self.state = STATE_NOTPLAYING
+                pass
+            elif aCurrState == audio.EPlaying:
+                self.state = STATE_PLAYING
+                pass
+            else:
+                # Incorrect value
+                pass
+        elif currentState == STATE_PAUSING:
+            if aCurrState == audio.ENotReady or aCurrState == audio.EOpen:
+                # Strange
+                self.state = STATE_NOTPLAYING
+                pass
+            elif aCurrState == audio.EPlaying:
+                self.state = STATE_PLAYING
+                pass
+            else:
+                # Incorrect value
+                pass
+        elif currentState == STATE_BUFFERING:
+            # Strange
+            if aCurrState == audio.ENotReady or aCurrState == audio.EOpen:
+                # Strange
+                self.state = STATE_NOTPLAYING
+                pass
+            elif aCurrState == audio.EPlaying:
+                self.state = STATE_PLAYING
+                pass
+            else:
+                # Incorrect value
+                pass
+        elif currentState == STATE_PLAYING:
+            if aCurrState == audio.ENotReady or aCurrState == audio.EOpen:
+                if aPrevState != audio.EPlaying:
+                    self.logger.warning(u"aPrevState is not audio.EPlaying")
+                self.state = STATE_NOTPLAYING
+                self._next()
+                pass
+            elif aCurrState == audio.EPlaying:
+                pass
+            else:
+                # Incorrect value
+                pass
+        self.update()
+        
+    def _play_urlAudioStream(self):
         if self.uasPlayer is None:
-            self.uasPlayer = urlaudiostream.New()
+            self.uasPlayer = urlaudiostream.New(tryWrapper(self._urlAudioStream_callback))
+
+        self.using = USING_URLAUDIOSTREAMPLAYER
+        self.uasPlayer.play(unicode(self.urlList[self.orderList[self.seq]]))
+        self.update()
+
+    def _play_audio(self, songPath):
+        try:
+            if self.audioPlayer is not None:
+                self.audioPlayer.close()
+                self.audioPlayer = None
+
+            self.audioPlayer = audio.Sound.open(songPath)
+            self.audioPlayer.set_volume(self.config['volume'] * self.audioPlayer.max_volume() / 100)
+            self.audioPlayer.player(callback = tryWrapper(self._audio_callback))
+        except Exception, e:
+            if self.audioPlayer is not None:
+                self.audioPlayer.close()
+
+            try:
+                if os.path.exists(songPath):
+                    os.remove(songPath)
+            except Exception, ee:
+                self.logger.error(ee.args)
+
+            raise e.__class__, e
+
+
+
+        
