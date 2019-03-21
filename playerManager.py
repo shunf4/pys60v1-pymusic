@@ -331,10 +331,13 @@ class PlayerManager(object):
         if index < 0 or index >= len(self.songList):
             raise ValueError, unicode("index out of range")
 
-        if self.seq + 1 < len(self.orderList) or self.orderList[self.seq + 1] != index:
-            self.orderList[self.seq + 1:self.seq + 1] = [index]
+        if self.config['order'] == ORDER_SHUFFLE:
+            if self.seq + 1 < len(self.orderList) or self.orderList[self.seq + 1] != index:
+                self.orderList[self.seq + 1:self.seq + 1] = [index]
+        else:
+            self.seq = index - 1
 
-        self._next()
+        self._next(True)
 
     def _next(self, manual = False):
         # 播放次序加一
@@ -699,7 +702,10 @@ class PlayerManager(object):
 
             self.audioPlayer = audio.Sound.open(songPath)
             self.audioPlayer.set_volume(self.config['volume'] * self.audioPlayer.max_volume() / 100)
-            self.audioPlayer.player(callback = tryWrapper(self._audio_callback))
+            self.audioPlayer.play(callback = tryWrapper(self._audio_callback))
+            self.using = USING_AUDIOPLAYER
+            self.state = STATE_PLAYING
+            self.update()
         except Exception, e:
             if self.audioPlayer is not None:
                 self.audioPlayer.close()
